@@ -77,6 +77,21 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAVE_MEGATRON_CORE_TIMERS = False
 
+try:
+    from zeus.monitor import ZeusMonitor
+    HAVE_ZEUS_MONITOR = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_ZEUS_MONITOR = False
+
+try:
+    from zeus.optimizer.pipeline_frequency import PipelineFrequencyOptimizer
+    HAVE_PERSEUS_OPTIMIZER = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_PERSEUS_OPTIMIZER = False
+
+from pathlib import Path
+from nemo.utils.env_var_parsing import get_envint
+
 __all__ = ["MegatronBaseModel"]
 
 
@@ -143,7 +158,39 @@ class MegatronBaseModel(NLPModel):
                 self.megatron_timers_cfg['log_option'] = 'minmax'  # minmax, max, all
             if 'barrier' not in self.megatron_timers_cfg:
                 self.megatron_timers_cfg['barrier'] = False
-            self.megatron_timers = Timers(log_level=2, log_option=self.megatron_timers_cfg['log_option'])
+            if 'enable_energy_monitoring' not in self.megatron_timers_cfg:
+                self.megatron_timers_cfg['enable_energy_monitoring'] = False
+            if 'output_dir' not in self.megatron_timers_cfg:
+                self.megatron_timers_cfg['output_dir'] = None
+                app_state = AppState()
+                if app_state.log_dir is not None:
+                    log_dir = Path(app_state.log_dir)
+                    self.megatron_timers_cfg['output_dir'] = log_dir / 'timers'
+            self.megatron_timers = Timers(log_level=2, log_option=self.megatron_timers_cfg['log_option'], 
+                enable_energy_monitoring=self.megatron_timers_cfg['enable_energy_monitoring'],
+                output_dir=self.megatron_timers_cfg['output_dir'],
+                device_idx=trainer.local_rank
+            )
+        
+        self.zeus_monitor = None
+        if self.cfg.get('enable_zeus_monitor', False) and HAVE_ZEUS_MONITOR:
+            self.zeus_monitor_cfg = dict(self.cfg.get('zeus_monitor_kwargs', dict()))
+            if 'gpu_indices' not in self.zeus_monitor_cfg:
+                self.zeus_monitor_cfg['gpu_indices'] = [trainer.local_rank]
+            if 'approx_instant_energy' not in self.zeus_monitor_cfg:
+                self.zeus_monitor_cfg['approx_instant_energy'] = True
+            if 'log_file' not in self.zeus_monitor_cfg:
+                app_state = AppState()
+                if app_state.log_dir is not None:
+                    log_dir = Path(app_state.log_dir)
+                    zeus_log_file = log_dir / f'zeus_monitor_localrank-{trainer.local_rank}.txt'
+                    self.zeus_monitor_cfg['log_file'] = str(zeus_log_file)
+                else:
+                    self.zeus_monitor_cfg['log_file'] = None
+            self.zeus_monitor = ZeusMonitor(**self.zeus_monitor_cfg)
+        
+        # Perseus optimizer will be initialized in on_train_start() after distributed setup
+        self.perseus_optimizer = None
 
         # set the megatron core model parallel config
         self.model_parallel_config: ModelParallelConfig = self.build_model_parallel_config()
@@ -218,9 +265,6 @@ class MegatronBaseModel(NLPModel):
 
         # This must be called after initialize model parallel since it needs to know the data parallel size
         self._validate_and_override_config()
-
-        # set the megatron core model parallel config
-        self.model_parallel_config: ModelParallelConfig = self.build_model_parallel_config()
 
         self.grad_clip_pl_default = False  # use pytorch default for gradient clipping. Default False
 
@@ -474,6 +518,33 @@ class MegatronBaseModel(NLPModel):
         """
         super().on_train_start()
         self.init_global_step = self.trainer.global_step
+        
+        # Initialize Perseus optimizer here after distributed setup is complete
+        if self.cfg.get('enable_perseus_optimizer', False) and HAVE_PERSEUS_OPTIMIZER and self.perseus_optimizer is None:
+            print(f"rank: {self.trainer.global_rank}, dp_rank: {parallel_state.get_data_parallel_rank()}, pp_rank: {parallel_state.get_pipeline_model_parallel_rank()}, tp_rank: {parallel_state.get_tensor_model_parallel_rank()}, device_id: {self.trainer.local_rank}, dp_degree: {parallel_state.get_data_parallel_world_size()}, pp_degree: {parallel_state.get_pipeline_model_parallel_world_size()}, tp_degree: {parallel_state.get_tensor_model_parallel_world_size()}, world_size: {self.trainer.world_size}")
+            self.perseus_optimizer = PipelineFrequencyOptimizer(
+                rank=self.trainer.global_rank,
+                dp_rank=parallel_state.get_data_parallel_rank(),
+                pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
+                tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+                device_id=self.trainer.local_rank,
+                dp_degree=parallel_state.get_data_parallel_world_size(),
+                pp_degree=parallel_state.get_pipeline_model_parallel_world_size(),
+                tp_degree=parallel_state.get_tensor_model_parallel_world_size(),
+                world_size=self.trainer.world_size,
+                server_url=self.cfg.get('perseus_server_url', 'http://127.0.0.1:7787'),
+                job_metadata=self.cfg.get('perseus_job_metadata', None),
+            )
+            self.model.config.perseus_optimizer = self.perseus_optimizer
+            print(f"Perseus optimizer successfully initialized for rank {self.trainer.global_rank}")
+    
+    def on_train_end(self) -> None:
+        """
+        Callback function invoked when the train ends.
+        """
+        super().on_train_end()
+        if self.megatron_timers is not None:
+            self.megatron_timers.shutdown()
 
     def on_validation_start(self) -> None:
         """
@@ -1225,6 +1296,8 @@ class MegatronBaseModel(NLPModel):
             "bf16": self.torch_dtype == torch.bfloat16 and megatron_amp_O2,
             "params_dtype": self.params_dtype,
             "timers": self.megatron_timers,
+            "zeus_monitor": self.zeus_monitor,
+            "perseus_optimizer": self.perseus_optimizer,
             "async_tensor_model_parallel_allreduce": self.cfg.get('tensor_model_parallel_world_size', 1) > 1
             and not self.cfg.get('sequence_parallel', False),
             "pipeline_dtype": pipeline_dtype,

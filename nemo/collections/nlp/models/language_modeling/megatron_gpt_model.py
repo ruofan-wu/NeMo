@@ -320,7 +320,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     Megatron GPT pretraining
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
+    def __init__(self, cfg: DictConfig, trainer: Trainer, freq_opt = None):
         if not HAVE_MEGATRON_CORE:
             logging.warning(
                 "megatron-core was not found. Please see the NeMo README for installation instructions:"
@@ -475,6 +475,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         if self.use_loss_mask and self.transformer_config.sequence_parallel:
             raise ValueError('Loss mask is not supported with sequence parallelism.')
+        
+        self.freq_opt = freq_opt
 
     def set_inference_config(self, inference_config):
         self._inference_config = inference_config
@@ -835,6 +837,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         The input batch to each micro-batch is fetched using the dataloader function
         in the micro-batch fwd function.
         """
+        if self.perseus_optimizer is not None:
+            self.perseus_optimizer.on_step_begin()
+
+        if self.zeus_monitor is not None:
+            self.zeus_monitor.begin_window("training_step")
+            
         # Initialize userbuffer communicators.
         if self.initialize_ub:
             self.initialize_ub_func()
@@ -905,8 +913,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 assert (
                     len(embedding_module.embedding_activation_buffer) == 0
                 ), "When you defer wgrads, this buffer should not hold stray activations"
+        
+        if self.zeus_monitor is not None:
+            self.zeus_monitor.begin_window("training_step_fwd_bwd_step_call")
 
         loss_mean = self.training_step_fwd_bwd_step_call(dataloader_iter, forward_only=False)
+
+        if self.zeus_monitor is not None:
+            self.zeus_monitor.end_window("training_step_fwd_bwd_step_call")
 
         if self.cfg.get('fp8', False):
             self.prev_step_training = self.training
@@ -1047,6 +1061,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             current_global_batch_size = num_microbatch_calculator.current_global_batch_size  # noqa: F821
             self.log('global_batch_size', current_global_batch_size, prog_bar=True, rank_zero_only=True, batch_size=1)
             self.if_first_step = 1
+        
+        if self.perseus_optimizer is not None:
+            self.perseus_optimizer.on_step_end()
+        
+        if self.zeus_monitor is not None:
+            self.zeus_monitor.end_window("training_step")
 
         return loss_mean
 
