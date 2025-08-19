@@ -84,6 +84,13 @@ except (ImportError, ModuleNotFoundError):
     HAVE_ZEUS_MONITOR = False
 
 try:
+    from zeus.monitor.power import PowerMonitor
+    from zeus.monitor.power import PowerDomain
+    HAVE_POWER_MONITOR = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_POWER_MONITOR = False
+
+try:
     from zeus.optimizer.pipeline_frequency import PipelineFrequencyOptimizer
     HAVE_PERSEUS_OPTIMIZER = True
 except (ImportError, ModuleNotFoundError):
@@ -183,11 +190,13 @@ class MegatronBaseModel(NLPModel):
                 app_state = AppState()
                 if app_state.log_dir is not None:
                     log_dir = Path(app_state.log_dir)
-                    zeus_log_file = log_dir / f'zeus_monitor_localrank-{trainer.local_rank}.txt'
+                    zeus_log_file = log_dir / f'zeus_monitor_global_rank-{trainer.global_rank}_local_rank-{trainer.local_rank}.txt'
                     self.zeus_monitor_cfg['log_file'] = str(zeus_log_file)
                 else:
                     self.zeus_monitor_cfg['log_file'] = None
             self.zeus_monitor = ZeusMonitor(**self.zeus_monitor_cfg)
+        
+        self.power_monitor = None
         
         # Perseus optimizer will be initialized in on_train_start() after distributed setup
         self.perseus_optimizer = None
@@ -537,6 +546,13 @@ class MegatronBaseModel(NLPModel):
             )
             self.model.config.perseus_optimizer = self.perseus_optimizer
             print(f"Perseus optimizer successfully initialized for rank {self.trainer.global_rank}")
+        
+        if self.cfg.get('enable_power_monitor', False) and HAVE_POWER_MONITOR:
+            self.power_monitor_cfg = dict(self.cfg.get('power_monitor_kwargs', dict()))
+            if 'gpu_indices' not in self.power_monitor_cfg:
+                self.power_monitor_cfg['gpu_indices'] = [self.trainer.local_rank]
+            self.power_monitor = PowerMonitor(**self.power_monitor_cfg)
+            print(f"Power monitor successfully initialized for local rank {self.trainer.local_rank}")
     
     def on_train_end(self) -> None:
         """
@@ -545,6 +561,19 @@ class MegatronBaseModel(NLPModel):
         super().on_train_end()
         if self.megatron_timers is not None:
             self.megatron_timers.shutdown()
+        
+        if self.power_monitor is not None:
+            timelines = self.power_monitor.get_power_timeline(PowerDomain.DEVICE_INSTANT)[self.trainer.local_rank]
+            app_state = AppState()
+            if app_state.log_dir is not None:
+                log_dir = Path(app_state.log_dir)
+                power_log_file = log_dir / f'power_monitor_global_rank-{self.trainer.global_rank}_local_rank-{self.trainer.local_rank}.txt'
+                with open(power_log_file, 'w') as f:
+                    f.write("timestamp,power\n")
+                    for timestamp, power in timelines:
+                        f.write(f"{timestamp},{power}\n")
+            else:
+                print(f"No log directory found for local rank {self.trainer.local_rank}")
 
     def on_validation_start(self) -> None:
         """
